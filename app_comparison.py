@@ -2,7 +2,7 @@
 """
 app_comparison.py
 =================
-Executive 3D + 2D Risk Topography Comparator (1 Year Ago vs. Today).
+Executive 3D + 2D Risk Topography & Optimal Transport Comparator (1 Year Ago vs. Today).
 
 Visual encoding:
 - (X, Y)        : Cluster coordinates from PCA / MDS (with optional Procrustes alignment)
@@ -10,7 +10,7 @@ Visual encoding:
 - Footprint σ   : Intra-Cluster Stress (clipped & log-scaled, safe baseline for 'Not Held')
 - Peak Markers  : Stress Traffic-Light Halo (<25% Green, 25–50% Amber, >50% Red, Not Held Slate)
 - Rings & Strip : Concentric Benchmark Factor-Distance Rings + Core / Mid / Outer breakdown
-- Tension Arcs  : "3rd Bet" bridges linking major overweight peaks straddling the Benchmark
+- OT Flows      : Exact Optimal Transport flattening plan (Peak -> Valley), colored by haul length
 """
 
 import io
@@ -19,7 +19,13 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-st.set_page_config(page_title="3D Risk Topography Comparator", layout="wide")
+try:
+    from scipy.optimize import linprog, linear_sum_assignment
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+
+st.set_page_config(page_title="3D Risk Topography & OT Comparator", layout="wide")
 
 
 # ---------------------------------------------------------
@@ -48,7 +54,7 @@ def plotly_export_config(filename: str) -> dict:
         "toImageButtonOptions": {
             "format": "png",
             "filename": filename,
-            "scale": 3,  # Crisp 3x retina export for slides
+            "scale": 3,
         },
     }
 
@@ -149,10 +155,12 @@ def prepare_dataframe(df: pd.DataFrame, weight_col: str) -> pd.DataFrame:
     return out.dropna(subset=["X", "Y"]).reset_index(drop=True)
 
 
-def align_procrustes(df_old: pd.DataFrame, df_new: pd.DataFrame) -> tuple[pd.DataFrame, float]:
+def align_procrustes(
+    df_old: pd.DataFrame, df_new: pd.DataFrame
+) -> tuple[pd.DataFrame, float, int]:
     """
     Rigidly aligns df_old (X, Y) onto df_new (X, Y) via orthogonal Procrustes
-    to remove arbitrary PCA/MDS sign flips or global rotations.
+    using shared Node_IDs. Returns (aligned_df, rmsd, num_shared_ids).
     """
     merged = pd.merge(
         df_old[["Node_ID", "X", "Y"]],
@@ -160,8 +168,9 @@ def align_procrustes(df_old: pd.DataFrame, df_new: pd.DataFrame) -> tuple[pd.Dat
         on="Node_ID",
         suffixes=("_old", "_new"),
     )
-    if len(merged) < 3:
-        return df_old.copy(), np.nan
+    n_shared = len(merged)
+    if n_shared < 3:
+        return df_old.copy(), np.nan, n_shared
 
     P = merged[["X_old", "Y_old"]].to_numpy(dtype=float)
     Q = merged[["X_new", "Y_new"]].to_numpy(dtype=float)
@@ -179,7 +188,7 @@ def align_procrustes(df_old: pd.DataFrame, df_new: pd.DataFrame) -> tuple[pd.Dat
     aligned_coords = (coords - p_mean) @ R + q_mean
     aligned_df["X"] = aligned_coords[:, 0]
     aligned_df["Y"] = aligned_coords[:, 1]
-    return aligned_df, rmsd
+    return aligned_df, rmsd, n_shared
 
 
 def compute_anchors(df: pd.DataFrame) -> dict[str, tuple[float, float]] | None:
@@ -214,38 +223,145 @@ def compute_anchors(df: pd.DataFrame) -> dict[str, tuple[float, float]] | None:
 
 
 # ---------------------------------------------------------
-# GEOMETRIC TENSION, RINGS & "3RD BET" STRADDLE BRIDGES
+# EXACT 2D OPTIMAL TRANSPORT FLATTENING PLAN (PEAK -> VALLEY)
 # ---------------------------------------------------------
-def compute_geometric_metrics(
-    df: pd.DataFrame, anchors: dict[str, tuple[float, float]] | None
-) -> dict[str, float]:
-    active_abs = df["Active_Pct"].abs().to_numpy(dtype=float)
-    active_share = 0.5 * float(np.sum(active_abs))
-    total_abs = float(np.sum(active_abs))
+def solve_optimal_transport(
+    df: pd.DataFrame,
+    node_z: np.ndarray,
+    r_core: float,
+    r_mid: float,
+) -> dict:
+    """
+    Solves the exact 2D Earth Mover's / Optimal Transport plan to flatten
+    the portfolio back to neutral (moving mass from Overweight Peaks into
+    Underweight Valleys at minimum Euclidean distance cost).
 
-    if anchors is None or total_abs <= 1e-12:
+    Returns:
+        w1_cost     : 2D Wasserstein W1 flattening cost (Active Share * Mean Haul)
+        mean_haul   : L_OT = W1 / Active Share (distance per unit of active share)
+        active_share: 0.5 * sum(|Active_Pct|) in %
+        routes      : list of transport routes sorted by W1 work contribution
+    """
+    acts = df["Active_Pct"].to_numpy(dtype=float)
+    active_share_pct = 0.5 * float(np.sum(np.abs(acts)))
+
+    peak_idx = np.where(acts > 1e-9)[0]
+    valley_idx = np.where(acts < -1e-9)[0]
+
+    if len(peak_idx) == 0 or len(valley_idx) == 0 or active_share_pct <= 1e-9:
         return {
-            "active_share": active_share,
-            "net_tilt": np.nan,
-            "tension_rms": np.nan,
-            "active_work": np.nan,
+            "w1_cost": 0.0,
+            "mean_haul": 0.0,
+            "active_share": active_share_pct,
+            "routes": [],
         }
 
-    bx, by = anchors["bench"]
-    px, py = anchors["port"]
-    net_tilt = float(np.hypot(px - bx, py - by))
+    xs = df["X"].to_numpy(dtype=float)
+    ys = df["Y"].to_numpy(dtype=float)
+    labels = df["Node_Label"].astype(str).to_numpy()
 
-    dists = np.hypot(df["X"].to_numpy(float) - bx, df["Y"].to_numpy(float) - by)
-    w_norm = active_abs / total_abs
-    tension_rms = float(np.sqrt(np.sum(w_norm * (dists ** 2))))
-    # Sum(|a_i| * d_i) with active weights in decimals -> mirrors W1 transport work
-    active_work = float(np.sum((active_abs / 100.0) * dists))
+    xp, yp = xs[peak_idx], ys[peak_idx]
+    xv, yv = xs[valley_idx], ys[valley_idx]
+    zp, zv = node_z[peak_idx], node_z[valley_idx]
 
+    supply_raw = acts[peak_idx]
+    demand_raw = np.abs(acts[valley_idx])
+    p = supply_raw / float(np.sum(supply_raw))
+    q = demand_raw / float(np.sum(demand_raw))
+
+    n_p, n_v = len(peak_idx), len(valley_idx)
+    C = np.hypot(xp[:, None] - xv[None, :], yp[:, None] - yv[None, :])
+
+    # Solve exact OT linear program via HiGHS (fallback to greedy if scipy absent)
+    gamma_norm = np.zeros((n_p, n_v), dtype=float)
+    solved_lp = False
+
+    if SCIPY_AVAILABLE:
+        n_vars = n_p * n_v
+        n_eq = n_p + max(n_v - 1, 0)
+        A_eq = np.zeros((n_eq, n_vars), dtype=float)
+        b_eq = np.zeros(n_eq, dtype=float)
+
+        for i in range(n_p):
+            A_eq[i, i * n_v : (i + 1) * n_v] = 1.0
+            b_eq[i] = p[i]
+        for j in range(n_v - 1):
+            A_eq[n_p + j, j::n_v] = 1.0
+            b_eq[n_p + j] = q[j]
+
+        res = linprog(
+            c=C.ravel(),
+            A_eq=A_eq,
+            b_eq=b_eq,
+            bounds=(0.0, None),
+            method="highs",
+        )
+        if res.success and res.x is not None:
+            gamma_norm = np.maximum(res.x.reshape(n_p, n_v), 0.0)
+            solved_lp = True
+
+    if not solved_lp:
+        # Nearest-neighbor greedy transport fallback
+        rem_p, rem_q = p.copy(), q.copy()
+        pairs = sorted(
+            [(C[i, j], i, j) for i in range(n_p) for j in range(n_v)],
+            key=lambda t: t[0],
+        )
+        for _, i, j in pairs:
+            if rem_p[i] > 1e-12 and rem_q[j] > 1e-12:
+                flow = min(rem_p[i], rem_q[j])
+                gamma_norm[i, j] = flow
+                rem_p[i] -= flow
+                rem_q[j] -= flow
+
+    mean_haul = float(np.sum(gamma_norm * C))
+    w1_cost = (active_share_pct / 100.0) * mean_haul
+
+    routes = []
+    for i in range(n_p):
+        for j in range(n_v):
+            g_ij = float(gamma_norm[i, j])
+            if g_ij <= 1e-5:
+                continue
+            mass_pct = g_ij * active_share_pct
+            dist_ij = float(C[i, j])
+            work_ij = (mass_pct / 100.0) * dist_ij
+            share_w1 = (100.0 * work_ij / w1_cost) if w1_cost > 1e-12 else 0.0
+
+            if dist_ij <= r_core:
+                haul_type, color = "Local Swap", "#0284c7"
+            elif dist_ij <= r_mid:
+                haul_type, color = "Mid-Range Haul", "#f59e0b"
+            else:
+                haul_type, color = "Long-Range Factor Haul", "#dc2626"
+
+            routes.append(
+                {
+                    "peak_label": labels[peak_idx[i]],
+                    "valley_label": labels[valley_idx[j]],
+                    "peak_act": float(acts[peak_idx[i]]),
+                    "valley_act": float(acts[valley_idx[j]]),
+                    "xp": float(xp[i]),
+                    "yp": float(yp[i]),
+                    "zp": float(zp[i]),
+                    "xv": float(xv[j]),
+                    "yv": float(yv[j]),
+                    "zv": float(zv[j]),
+                    "mass_pct": mass_pct,
+                    "dist": dist_ij,
+                    "work": work_ij,
+                    "share_w1_pct": share_w1,
+                    "haul_type": haul_type,
+                    "color": color,
+                }
+            )
+
+    routes.sort(key=lambda r: r["work"], reverse=True)
     return {
-        "active_share": active_share,
-        "net_tilt": net_tilt,
-        "tension_rms": tension_rms,
-        "active_work": active_work,
+        "w1_cost": w1_cost,
+        "mean_haul": mean_haul,
+        "active_share": active_share_pct,
+        "routes": routes,
     }
 
 
@@ -264,76 +380,11 @@ def compute_ring_breakdown(
     if tot <= 1e-12:
         return {"Core": 0.0, "Mid": 0.0, "Outer Tail": 0.0}
 
-    core_pct = 100.0 * float(np.sum(abs_a[dists <= r_core])) / tot
-    mid_pct = 100.0 * float(np.sum(abs_a[(dists > r_core) & (dists <= r_mid)])) / tot
-    outer_pct = 100.0 * float(np.sum(abs_a[dists > r_mid])) / tot
-    return {"Core": core_pct, "Mid": mid_pct, "Outer Tail": outer_pct}
-
-
-def find_straddle_bridges(
-    df: pd.DataFrame,
-    node_z: np.ndarray,
-    anchors: dict[str, tuple[float, float]] | None,
-    min_ow_pct: float = 1.5,
-    max_bridges: int = 3,
-    cos_threshold: float = -0.15,
-) -> list[dict]:
-    """
-    Finds the highest-tension pairs of Overweight clusters sitting on opposite flanks
-    of the Benchmark (angle across Benchmark > ~98.6 deg) -> the implicit "3rd Bet".
-    """
-    if anchors is None or max_bridges <= 0:
-        return []
-
-    bx, by = anchors["bench"]
-    ow_idx = np.where(df["Active_Pct"].to_numpy(float) >= min_ow_pct)[0]
-    if len(ow_idx) < 2:
-        return []
-
-    bridges = []
-    xs = df["X"].to_numpy(float)
-    ys = df["Y"].to_numpy(float)
-    acts = df["Active_Pct"].to_numpy(float)
-    labels = df["Node_Label"].astype(str).to_numpy()
-
-    for idx_a in range(len(ow_idx)):
-        i = ow_idx[idx_a]
-        ui_x, ui_y = xs[i] - bx, ys[i] - by
-        ni = float(np.hypot(ui_x, ui_y))
-        if ni < 1e-6:
-            continue
-        for idx_b in range(idx_a + 1, len(ow_idx)):
-            j = ow_idx[idx_b]
-            uj_x, uj_y = xs[j] - bx, ys[j] - by
-            nj = float(np.hypot(uj_x, uj_y))
-            if nj < 1e-6:
-                continue
-
-            cos_th = float((ui_x * uj_x + ui_y * uj_y) / (ni * nj))
-            if cos_th < cos_threshold:
-                sep = float(np.hypot(xs[i] - xs[j], ys[i] - ys[j]))
-                angle_deg = float(np.degrees(np.arccos(np.clip(cos_th, -1.0, 1.0))))
-                score = float(np.sqrt(acts[i] * acts[j]) * sep * (1.0 - cos_th) * 0.5)
-                bridges.append(
-                    {
-                        "label_i": labels[i],
-                        "label_j": labels[j],
-                        "act_i": float(acts[i]),
-                        "act_j": float(acts[j]),
-                        "xi": float(xs[i]),
-                        "yi": float(ys[i]),
-                        "zi": float(node_z[i]),
-                        "xj": float(xs[j]),
-                        "yj": float(ys[j]),
-                        "zj": float(node_z[j]),
-                        "sep": sep,
-                        "angle_deg": angle_deg,
-                        "score": score,
-                    }
-                )
-
-    bridges.sort(key=lambda b: b["score"], reverse=True)
-    return bridges[:max_bridges]
+    return {
+        "Core": 100.0 * float(np.sum(abs_a[dists <= r_core])) / tot,
+        "Mid": 100.0 * float(np.sum(abs_a[(dists > r_core) & (dists <= r_mid)])) / tot,
+        "Outer Tail": 100.0 * float(np.sum(abs_a[dists > r_mid])) / tot,
+    }
 
 
 # ---------------------------------------------------------
@@ -355,7 +406,6 @@ def compute_sigmas(
         u = np.log1p(log_k * s_clipped) / np.log1p(log_k * stress_cap)
     else:
         u = s_clipped / stress_cap
-
     return (sigma_min_frac + (sigma_max_frac - sigma_min_frac) * u) * span
 
 
@@ -438,38 +488,34 @@ def select_decollided_labels(
     min_dist: float,
     min_active_pct: float,
 ) -> pd.DataFrame:
-    """
-    Greedily picks the largest |Active_Pct| clusters while enforcing a minimum 2D
-    separation so peak labels don't pile on top of each other.
-    """
     if max_labels <= 0:
         return df.iloc[0:0].copy()
 
     cand = df.assign(_abs=df["Active_Pct"].abs(), _nz=node_z)
     cand = cand[cand["_abs"] >= min_active_pct].sort_values("_abs", ascending=False)
 
-    chosen_rows = []
-    placed_xy = []
+    chosen_rows, placed_xy = [], []
     for row in cand.itertuples():
         if len(chosen_rows) >= max_labels:
             break
         if all(np.hypot(row.X - px, row.Y - py) >= min_dist for px, py in placed_xy):
             chosen_rows.append(row.Index)
             placed_xy.append((row.X, row.Y))
-
     return cand.loc[chosen_rows]
 
 
-def stress_marker_color(stress_pct: float, is_not_held: bool, active_pct: float, use_stress_halo: bool) -> str:
+def stress_marker_color(
+    stress_pct: float, is_not_held: bool, active_pct: float, use_stress_halo: bool
+) -> str:
     if not use_stress_halo:
         return "#00441b" if active_pct >= 0 else "#67000d"
     if is_not_held:
-        return "#64748b"  # Slate: Not Held
+        return "#64748b"
     if stress_pct >= 50.0:
-        return "#dc2626"  # Red: High intra-cluster stress
+        return "#dc2626"
     if stress_pct >= 25.0:
-        return "#f59e0b"  # Amber: Moderate stress
-    return "#16a34a"      # Green: Low stress
+        return "#f59e0b"
+    return "#16a34a"
 
 
 def build_hover_texts(df: pd.DataFrame, sigmas: np.ndarray) -> list[str]:
@@ -497,7 +543,7 @@ def clean_axis_dtick(span: float) -> float:
 
 
 # ---------------------------------------------------------
-# 3D LANDSCAPE FIGURE
+# 3D LANDSCAPE FIGURE WITH OT FLATTENING FLOWS
 # ---------------------------------------------------------
 def make_3d_landscape_figure(
     title: str,
@@ -521,7 +567,7 @@ def make_3d_landscape_figure(
     anchors: dict[str, tuple[float, float]] | None,
     show_rings: bool,
     ring_radii: tuple[float, float, float],
-    bridges: list[dict],
+    ot_routes: list[dict],
     blend_mode: str,
     camera_cfg: dict,
 ) -> go.Figure:
@@ -579,37 +625,32 @@ def make_3d_landscape_figure(
             )
         )
 
-    # Concentric Benchmark Factor-Distance Rings on the Z ≈ 0 floor
+    # Concentric Benchmark Factor-Distance Rings on Z ≈ 0 floor
     if show_rings and anchors is not None:
         bx, by = anchors["bench"]
         theta = np.linspace(0, 2 * np.pi, 96)
-        ring_styles = [
+        for r_val, r_lbl, r_col, r_dash in [
             (ring_radii[0], "Core", "rgba(37, 99, 235, 0.45)", "dash"),
             (ring_radii[1], "Mid", "rgba(100, 116, 139, 0.40)", "dot"),
             (ring_radii[2], "Outer", "rgba(148, 163, 184, 0.35)", "dot"),
-        ]
-        for r_val, r_lbl, r_col, r_dash in ring_styles:
+        ]:
             rx = bx + r_val * np.cos(theta)
             ry = by + r_val * np.sin(theta)
             mask = (
                 (rx >= x_range[0]) & (rx <= x_range[1]) &
                 (ry >= y_range[0]) & (ry <= y_range[1])
             )
-            rx_m = np.where(mask, rx, np.nan)
-            ry_m = np.where(mask, ry, np.nan)
-            rz_m = np.full_like(rx_m, 0.006 * z_lim)
             fig.add_trace(
                 go.Scatter3d(
-                    x=rx_m,
-                    y=ry_m,
-                    z=rz_m,
+                    x=np.where(mask, rx, np.nan),
+                    y=np.where(mask, ry, np.nan),
+                    z=np.full_like(rx, 0.006 * z_lim),
                     mode="lines",
-                    line=dict(color=r_col, width=2.2, dash=r_dash),
+                    line=dict(color=r_col, width=2.0, dash=r_dash),
                     hoverinfo="skip",
                     showlegend=False,
                 )
             )
-            # Subtle ring tag at -45 deg if inside bounds
             tx, ty = bx + r_val * 0.707, by - r_val * 0.707
             if x_range[0] < tx < x_range[1] and y_range[0] < ty < y_range[1]:
                 fig.add_trace(
@@ -625,7 +666,56 @@ def make_3d_landscape_figure(
                     )
                 )
 
-    # Material cluster markers (filtered to avoid tiny stray dots on mountain flanks)
+    # Optimal Transport Flattening Flows (Mountain Peak -> Valley Pit)
+    if ot_routes:
+        max_mass = max(r["mass_pct"] for r in ot_routes)
+        seen_legend = set()
+        t = np.linspace(0.0, 1.0, 25)
+        for r in ot_routes:
+            ax = r["xp"] + t * (r["xv"] - r["xp"])
+            ay = r["yp"] + t * (r["yv"] - r["yp"])
+            # Graceful arch above the higher endpoint so the haul route never clips into terrain
+            z_base = r["zp"] + t * (r["zv"] - r["zp"])
+            arch_lift = (0.14 + 0.14 * min(r["dist"] / max(ring_radii[1], 1e-3), 1.5)) * z_lim
+            az = z_base + arch_lift * 4.0 * t * (1.0 - t)
+
+            lw = float(np.clip(2.0 + 4.0 * (r["mass_pct"] / max(max_mass, 1e-6)), 2.2, 6.2))
+            show_leg = r["haul_type"] not in seen_legend
+            seen_legend.add(r["haul_type"])
+
+            fig.add_trace(
+                go.Scatter3d(
+                    x=ax,
+                    y=ay,
+                    z=az,
+                    mode="lines",
+                    line=dict(color=r["color"], width=lw),
+                    hoverinfo="skip",
+                    name=r["haul_type"] if show_leg else None,
+                    showlegend=show_leg,
+                )
+            )
+            mid = len(t) // 2
+            fig.add_trace(
+                go.Scatter3d(
+                    x=[ax[mid]],
+                    y=[ay[mid]],
+                    z=[az[mid]],
+                    mode="markers",
+                    marker=dict(size=4.2, color=r["color"], symbol="diamond"),
+                    hovertemplate=(
+                        f"<b>🚚 OT Flattening Route ({r['haul_type']})</b><br>"
+                        f"From Peak: {r['peak_label'][:28]} ({r['peak_act']:+.1f}%)<br>"
+                        f"To Valley: {r['valley_label'][:28]} ({r['valley_act']:+.1f}%)<br>"
+                        f"Weight Moved: {r['mass_pct']:.2f}%<br>"
+                        f"Haul Distance d_ij: {r['dist']:.3f}<br>"
+                        f"Share of W1 Flattening Cost: {r['share_w1_pct']:.1f}%<extra></extra>"
+                    ),
+                    showlegend=False,
+                )
+            )
+
+    # Material cluster markers
     hover_all = build_hover_texts(df, sigmas)
     mat_mask = df["Active_Pct"].abs().to_numpy(float) >= min_marker_active
     df_mat = df.loc[mat_mask]
@@ -653,7 +743,7 @@ def make_3d_landscape_figure(
             )
         )
 
-    # De-collided peak labels
+    # De-collided cluster labels
     if show_labels and top_n_labels > 0:
         lbl_df = select_decollided_labels(
             df, node_z, top_n_labels, min_dist=0.12 * span, min_active_pct=min_marker_active
@@ -672,46 +762,7 @@ def make_3d_landscape_figure(
                 )
             )
 
-    # "3rd Bet" Cross-Benchmark Tension Bridges
-    for b_idx, br in enumerate(bridges):
-        t = np.linspace(0.0, 1.0, 25)
-        ax = br["xi"] + t * (br["xj"] - br["xi"])
-        ay = br["yi"] + t * (br["yj"] - br["yi"])
-        arch_lift = 0.14 * z_lim * 4.0 * t * (1.0 - t)
-        az = br["zi"] + t * (br["zj"] - br["zi"]) + arch_lift
-
-        fig.add_trace(
-            go.Scatter3d(
-                x=ax,
-                y=ay,
-                z=az,
-                mode="lines",
-                line=dict(color="#d97706", width=3.5, dash="dash"),
-                hoverinfo="skip",
-                name="3rd Bet (Correlation Bridge)" if b_idx == 0 else None,
-                showlegend=(b_idx == 0),
-            )
-        )
-        # Midpoint tooltip marker
-        mid = len(t) // 2
-        fig.add_trace(
-            go.Scatter3d(
-                x=[ax[mid]],
-                y=[ay[mid]],
-                z=[az[mid]],
-                mode="markers",
-                marker=dict(size=4, color="#d97706", symbol="diamond-open"),
-                hovertemplate=(
-                    f"<b>⚠️ 3rd Bet (Cross-Benchmark Tension)</b><br>"
-                    f"{br['label_i'][:28]} ({br['act_i']:+.1f}%)<br>"
-                    f"↔ {br['label_j'][:28]} ({br['act_j']:+.1f}%)<br>"
-                    f"Separation d_ij: {br['sep']:.3f} | Angle: {br['angle_deg']:.0f}°<extra></extra>"
-                ),
-                showlegend=False,
-            )
-        )
-
-    # Benchmark & Portfolio Beacons (with anti-overlap text layout)
+    # Benchmark & Portfolio Beacons
     if anchors is not None:
         bx, by = anchors["bench"]
         px, py = anchors["port"]
@@ -723,9 +774,10 @@ def make_3d_landscape_figure(
             xs, ys, ws, sigmas, np.array([bx, px]), np.array([by, py]), blend_mode
         )
         z_surf_b, z_surf_p = float(surf_zs[0]), float(surf_zs[1])
-        z_beacon_b = z_lim * 0.82
-        z_beacon_p = z_lim * 0.88 if np.hypot(px - bx, py - by) < 0.06 * span else z_beacon_b
         tilt_dist = float(np.hypot(px - bx, py - by))
+        tight_overlap = tilt_dist < 0.06 * span
+        z_beacon_b = z_lim * 0.82
+        z_beacon_p = z_lim * 0.88 if tight_overlap else z_beacon_b
 
         fig.add_trace(
             go.Scatter3d(
@@ -738,7 +790,6 @@ def make_3d_landscape_figure(
                 showlegend=False,
             )
         )
-
         if tilt_dist > 1e-4:
             fig.add_trace(
                 go.Scatter3d(
@@ -746,13 +797,12 @@ def make_3d_landscape_figure(
                     y=[by, py],
                     z=[z_beacon_b, z_beacon_p],
                     mode="lines",
-                    line=dict(color="#111827", width=3.5, dash="dash"),
+                    line=dict(color="#111827", width=3.2, dash="dash"),
                     hoverinfo="skip",
                     showlegend=False,
                 )
             )
 
-        tight_overlap = tilt_dist < 0.06 * span
         fig.add_trace(
             go.Scatter3d(
                 x=[bx],
@@ -774,7 +824,6 @@ def make_3d_landscape_figure(
                 name="Benchmark",
             )
         )
-
         fig.add_trace(
             go.Scatter3d(
                 x=[px],
@@ -800,11 +849,11 @@ def make_3d_landscape_figure(
 
     fig.update_layout(
         title=dict(text=title, x=0.02, font=dict(size=16)),
-        height=590,
+        height=595,
         margin=dict(l=8, r=18, t=42, b=8),
         legend=dict(
             orientation="h", yanchor="bottom", y=0.96, xanchor="right", x=0.99,
-            bgcolor="rgba(255,255,255,0.8)", font=dict(size=11),
+            bgcolor="rgba(255,255,255,0.82)", font=dict(size=10.5),
         ),
         scene=dict(
             xaxis=dict(title="MDS X", range=list(x_range), dtick=dtick_xy, tickformat=".1f"),
@@ -819,7 +868,7 @@ def make_3d_landscape_figure(
 
 
 # ---------------------------------------------------------
-# 2D METRIC-TRUE TOP-DOWN TOPOGRAPHIC MAP
+# 2D METRIC-TRUE TOP-DOWN TOPOGRAPHIC MAP WITH OT ARROWS
 # ---------------------------------------------------------
 def make_2d_topomap_figure(
     title: str,
@@ -842,7 +891,7 @@ def make_2d_topomap_figure(
     anchors: dict[str, tuple[float, float]] | None,
     show_rings: bool,
     ring_radii: tuple[float, float, float],
-    bridges: list[dict],
+    ot_routes: list[dict],
 ) -> go.Figure:
     fig = go.Figure()
     span = max(x_range[1] - x_range[0], y_range[1] - y_range[0])
@@ -874,14 +923,13 @@ def make_2d_topomap_figure(
         )
     )
 
-    # Metric-true concentric Benchmark distance rings
     if show_rings and anchors is not None:
         bx, by = anchors["bench"]
         theta = np.linspace(0, 2 * np.pi, 128)
         for r_val, r_lbl, r_col, r_dash in [
-            (ring_radii[0], "Core", "rgba(37, 99, 235, 0.60)", "dash"),
-            (ring_radii[1], "Mid", "rgba(71, 85, 105, 0.45)", "dot"),
-            (ring_radii[2], "Outer", "rgba(100, 116, 139, 0.35)", "dot"),
+            (ring_radii[0], "Core", "rgba(37, 99, 235, 0.58)", "dash"),
+            (ring_radii[1], "Mid", "rgba(71, 85, 105, 0.44)", "dot"),
+            (ring_radii[2], "Outer", "rgba(100, 116, 139, 0.34)", "dot"),
         ]:
             fig.add_trace(
                 go.Scatter(
@@ -898,38 +946,65 @@ def make_2d_topomap_figure(
                 fig.add_annotation(
                     x=tx, y=ty, text=r_lbl, showarrow=False,
                     font=dict(size=9, color="#475569"),
-                    bgcolor="rgba(255,255,255,0.65)",
+                    bgcolor="rgba(255,255,255,0.68)",
                 )
 
-    # "3rd Bet" Tension Bridges
-    for b_idx, br in enumerate(bridges):
-        fig.add_trace(
-            go.Scatter(
-                x=[br["xi"], br["xj"]],
-                y=[br["yi"], br["yj"]],
-                mode="lines",
-                line=dict(color="#d97706", width=2.8, dash="dash"),
-                hoverinfo="skip",
-                name="3rd Bet Bridge" if b_idx == 0 else None,
-                showlegend=(b_idx == 0),
+    # Optimal Transport Directed Arrows (Peak -> Valley)
+    if ot_routes:
+        max_mass = max(r["mass_pct"] for r in ot_routes)
+        seen_legend = set()
+        for r in ot_routes:
+            lw = float(np.clip(1.6 + 3.0 * (r["mass_pct"] / max(max_mass, 1e-6)), 1.6, 4.6))
+            show_leg = r["haul_type"] not in seen_legend
+            seen_legend.add(r["haul_type"])
+
+            # Dummy legend entry + hover midpoint
+            mx, my = 0.5 * (r["xp"] + r["xv"]), 0.5 * (r["yp"] + r["yv"])
+            fig.add_trace(
+                go.Scatter(
+                    x=[r["xp"], mx, r["xv"]],
+                    y=[r["yp"], my, r["yv"]],
+                    mode="lines",
+                    line=dict(color=r["color"], width=lw),
+                    opacity=0.85,
+                    hoverinfo="skip",
+                    name=r["haul_type"] if show_leg else None,
+                    showlegend=show_leg,
+                )
             )
-        )
-        mx, my = 0.5 * (br["xi"] + br["xj"]), 0.5 * (br["yi"] + br["yj"])
-        fig.add_trace(
-            go.Scatter(
-                x=[mx],
-                y=[my],
-                mode="markers",
-                marker=dict(size=7, color="#d97706", symbol="diamond-open", line=dict(width=2)),
-                hovertemplate=(
-                    f"<b>⚠️ 3rd Bet Bridge</b><br>"
-                    f"{br['label_i'][:28]} ({br['act_i']:+.1f}%)<br>"
-                    f"↔ {br['label_j'][:28]} ({br['act_j']:+.1f}%)<br>"
-                    f"Separation d_ij: {br['sep']:.3f} | Angle: {br['angle_deg']:.0f}°<extra></extra>"
-                ),
-                showlegend=False,
+            # Crisp directional arrowhead pointing into the Valley
+            fig.add_annotation(
+                x=r["xv"],
+                y=r["yv"],
+                ax=r["xp"],
+                ay=r["yp"],
+                xref="x",
+                yref="y",
+                axref="x",
+                ayref="y",
+                showarrow=True,
+                arrowhead=2,
+                arrowsize=1.05,
+                arrowwidth=lw * 0.85,
+                arrowcolor=r["color"],
+                opacity=0.88,
             )
-        )
+            fig.add_trace(
+                go.Scatter(
+                    x=[mx],
+                    y=[my],
+                    mode="markers",
+                    marker=dict(size=7, color=r["color"], symbol="diamond", line=dict(color="white", width=1)),
+                    hovertemplate=(
+                        f"<b>🚚 OT Flattening Route ({r['haul_type']})</b><br>"
+                        f"Peak: {r['peak_label'][:28]} ({r['peak_act']:+.1f}%)<br>"
+                        f"→ Valley: {r['valley_label'][:28]} ({r['valley_act']:+.1f}%)<br>"
+                        f"Weight Moved: {r['mass_pct']:.2f}%<br>"
+                        f"Haul Distance: {r['dist']:.3f} ({r['share_w1_pct']:.1f}% of W1)<extra></extra>"
+                    ),
+                    showlegend=False,
+                )
+            )
 
     # Material cluster markers
     hover_all = build_hover_texts(df, sigmas)
@@ -955,7 +1030,6 @@ def make_2d_topomap_figure(
             )
         )
 
-    # De-collided labels
     if show_labels and top_n_labels > 0:
         lbl_df = select_decollided_labels(
             df, node_z, top_n_labels, min_dist=0.12 * span, min_active_pct=min_marker_active
@@ -973,23 +1047,21 @@ def make_2d_topomap_figure(
                 ax=0,
                 ay=-20 if row.Active_Pct >= 0 else 20,
                 font=dict(size=9.5, color="#111827"),
-                bgcolor="rgba(255,255,255,0.78)",
+                bgcolor="rgba(255,255,255,0.80)",
                 borderpad=2,
             )
 
-    # Benchmark & Portfolio Markers + Tilt Arrow
     if anchors is not None:
         bx, by = anchors["bench"]
         px, py = anchors["port"]
         tilt_dist = float(np.hypot(px - bx, py - by))
-
         if tilt_dist > 1e-4:
             fig.add_trace(
                 go.Scatter(
                     x=[bx, px],
                     y=[by, py],
                     mode="lines",
-                    line=dict(color="#111827", width=2.4),
+                    line=dict(color="#111827", width=2.2, dash="dash"),
                     hoverinfo="skip",
                     showlegend=False,
                 )
@@ -1026,7 +1098,7 @@ def make_2d_topomap_figure(
 
     fig.update_layout(
         title=dict(text=title, x=0.02, font=dict(size=15)),
-        height=490,
+        height=500,
         margin=dict(l=45, r=15, t=42, b=40),
         legend=dict(
             orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=0.99,
@@ -1042,9 +1114,6 @@ def make_2d_topomap_figure(
     return fig
 
 
-# ---------------------------------------------------------
-# CORE / MID / OUTER ACTIVE-RISK STRIP
-# ---------------------------------------------------------
 def make_ring_strip_figure(breakdown: dict[str, float], label: str) -> go.Figure:
     fig = go.Figure()
     colors = {"Core": "#2563eb", "Mid": "#64748b", "Outer Tail": "#dc2626"}
@@ -1081,6 +1150,102 @@ def make_ring_strip_figure(breakdown: dict[str, float], label: str) -> go.Figure
         plot_bgcolor="rgba(0,0,0,0)",
     )
     return fig
+
+
+# ---------------------------------------------------------
+# OPTIONAL CLUSTER MIGRATION BUILDER (EXACT OR HUNGARIAN)
+# ---------------------------------------------------------
+def build_cluster_comparison_table(
+    df_old: pd.DataFrame, df_new: pd.DataFrame, match_mode: str
+) -> pd.DataFrame:
+    if match_mode == "Exact Node_ID Match" or not SCIPY_AVAILABLE:
+        comp = pd.merge(
+            df_old[["Node_ID", "Node_Label", "Active_Pct", "Stress_Pct", "X", "Y"]],
+            df_new[["Node_ID", "Node_Label", "Active_Pct", "Stress_Pct", "X", "Y"]],
+            on="Node_ID",
+            how="outer",
+            suffixes=("_1Y", "_Now"),
+        )
+        comp["Cluster"] = comp["Node_Label_Now"].fillna(comp["Node_Label_1Y"])
+        comp["Δ Active Wt (%)"] = comp["Active_Pct_Now"].fillna(0.0) - comp["Active_Pct_1Y"].fillna(0.0)
+        comp["Δ Stress (pp)"] = comp["Stress_Pct_Now"].fillna(0.0) - comp["Stress_Pct_1Y"].fillna(0.0)
+        comp["Spatial Dist (ΔXY)"] = np.hypot(
+            comp["X_Now"] - comp["X_1Y"], comp["Y_Now"] - comp["Y_1Y"]
+        )
+        return comp[
+            [
+                "Cluster",
+                "Active_Pct_1Y",
+                "Active_Pct_Now",
+                "Δ Active Wt (%)",
+                "Stress_Pct_1Y",
+                "Stress_Pct_Now",
+                "Δ Stress (pp)",
+                "Spatial Dist (ΔXY)",
+            ]
+        ].rename(
+            columns={
+                "Active_Pct_1Y": "Active Wt 1Y (%)",
+                "Active_Pct_Now": "Active Wt Now (%)",
+                "Stress_Pct_1Y": "Stress 1Y (%)",
+                "Stress_Pct_Now": "Stress Now (%)",
+            }
+        ).sort_values("Δ Active Wt (%)", key=lambda s: s.abs(), ascending=False)
+
+    # Hungarian Geometric Matching on (X, Y) proximity
+    P = df_old[["X", "Y"]].to_numpy(float)
+    Q = df_new[["X", "Y"]].to_numpy(float)
+    dist_mat = np.hypot(P[:, 0:1] - Q[:, 0:1].T, P[:, 1:2] - Q[:, 1:2].T)
+    row_ind, col_ind = linear_sum_assignment(dist_mat)
+
+    matched_old, matched_new = set(row_ind.tolist()), set(col_ind.tolist())
+    rows = []
+    for i, j in zip(row_ind, col_ind):
+        r_o, r_n = df_old.iloc[i], df_new.iloc[j]
+        rows.append(
+            {
+                "Cluster (1Y Ago)": r_o["Node_Label"],
+                "Matched Cluster (Today)": r_n["Node_Label"],
+                "Match Dist (ΔXY)": float(dist_mat[i, j]),
+                "Active Wt 1Y (%)": float(r_o["Active_Pct"]),
+                "Active Wt Now (%)": float(r_n["Active_Pct"]),
+                "Δ Active Wt (%)": float(r_n["Active_Pct"] - r_o["Active_Pct"]),
+                "Stress 1Y (%)": float(r_o["Stress_Pct"]),
+                "Stress Now (%)": float(r_n["Stress_Pct"]),
+            }
+        )
+    for i in range(len(df_old)):
+        if i not in matched_old:
+            r_o = df_old.iloc[i]
+            rows.append(
+                {
+                    "Cluster (1Y Ago)": r_o["Node_Label"],
+                    "Matched Cluster (Today)": "— (Unmatched)",
+                    "Match Dist (ΔXY)": np.nan,
+                    "Active Wt 1Y (%)": float(r_o["Active_Pct"]),
+                    "Active Wt Now (%)": np.nan,
+                    "Δ Active Wt (%)": -float(r_o["Active_Pct"]),
+                    "Stress 1Y (%)": float(r_o["Stress_Pct"]),
+                    "Stress Now (%)": np.nan,
+                }
+            )
+    for j in range(len(df_new)):
+        if j not in matched_new:
+            r_n = df_new.iloc[j]
+            rows.append(
+                {
+                    "Cluster (1Y Ago)": "— (Unmatched)",
+                    "Matched Cluster (Today)": r_n["Node_Label"],
+                    "Match Dist (ΔXY)": np.nan,
+                    "Active Wt 1Y (%)": np.nan,
+                    "Active Wt Now (%)": float(r_n["Active_Pct"]),
+                    "Δ Active Wt (%)": float(r_n["Active_Pct"]),
+                    "Stress 1Y (%)": np.nan,
+                    "Stress Now (%)": float(r_n["Stress_Pct"]),
+                }
+            )
+
+    return pd.DataFrame(rows).sort_values("Δ Active Wt (%)", key=lambda s: s.abs(), ascending=False)
 
 
 def make_synthetic_1y_ago(df_today: pd.DataFrame) -> pd.DataFrame:
@@ -1165,8 +1330,12 @@ sigma_max_frac = st.sidebar.slider("Max Footprint σ_max (% span)", 1.5, 10.0, 4
 if sigma_max_frac < sigma_min_frac:
     sigma_max_frac = sigma_min_frac
 
-st.sidebar.header("4. Risk Overlays & Decluttering")
-do_procrustes = st.sidebar.checkbox("Align 1Y Ago to Today (Procrustes)", value=True)
+st.sidebar.header("4. Optimal Transport & Overlays")
+do_procrustes = st.sidebar.checkbox(
+    "Align 1Y Ago to Today (Procrustes)",
+    value=True,
+    help="Requires >= 3 matching Node_IDs; automatically skipped if dynamic clusters differ.",
+)
 show_beacons = st.sidebar.checkbox("Show Benchmark & Portfolio Beacons", value=True)
 center_on_bench = st.sidebar.checkbox(
     "Center Origin (0, 0) on Benchmark", value=False, disabled=not show_beacons
@@ -1177,17 +1346,16 @@ show_rings = st.sidebar.checkbox(
 core_ring_frac = st.sidebar.slider(
     "Core Ring Radius (% of max distance)", 15, 50, 32, 2, disabled=not (show_beacons and show_rings)
 ) / 100.0
-show_bridges = st.sidebar.checkbox(
-    "Show '3rd Bet' Tension Bridges",
+show_ot_flows = st.sidebar.checkbox(
+    "Show Optimal Transport Flattening Flows",
     value=True,
-    disabled=not show_beacons,
-    help="Connects major overweight peaks straddling opposite sides of the Benchmark.",
+    help="Plots the minimum-cost Peak -> Valley moves required to flatten the portfolio back to neutral.",
 )
-min_bridge_ow = st.sidebar.slider(
-    "Min Overweight for Bridge (%)", 0.5, 5.0, 1.5, 0.25, disabled=not (show_beacons and show_bridges)
+top_k_ot = st.sidebar.slider(
+    "Top OT Flattening Routes Shown", 1, 15, 6, 1, disabled=not show_ot_flows
 )
-max_bridges = st.sidebar.slider(
-    "Max Tension Bridges", 1, 5, 3, 1, disabled=not (show_beacons and show_bridges)
+min_ot_mass_pct = st.sidebar.slider(
+    "Min Route Mass (% Active Wt)", 0.2, 5.0, 0.8, 0.2, disabled=not show_ot_flows
 )
 use_stress_halo = st.sidebar.checkbox(
     "Peak Markers = Stress Traffic Light",
@@ -1205,18 +1373,31 @@ show_labels = st.sidebar.checkbox("Show De-Collided Cluster Labels", value=True)
 top_n_labels = st.sidebar.slider("Max Labels", 0, 15, 7, disabled=not show_labels)
 grid_res = st.sidebar.select_slider("Grid Resolution", options=[70, 90, 110, 130, 160], value=110)
 
+st.sidebar.header("5. Optional Cluster Comparison")
+show_cluster_table = st.sidebar.checkbox(
+    "Show Cluster Migration Table",
+    value=False,
+    help="Enable when clusters share the same taxonomy or when using Hungarian geometric matching.",
+)
+cluster_match_mode = st.sidebar.radio(
+    "Cluster Matching Mode",
+    ["Exact Node_ID Match", "Hungarian Geometric Match (ΔXY)"],
+    index=0,
+    disabled=not show_cluster_table,
+)
+
 
 # ---------------------------------------------------------
 # HEADER & FILE LOADING
 # ---------------------------------------------------------
 if not slide_mode:
-    st.title("🏔️ Portfolio Risk Topography: 1 Year Ago vs. Today")
+    st.title("🏔️ Portfolio Risk Topography & Optimal Transport Plan")
     st.caption(
         "Mountains = Overweight · Valleys = Underweight · Width = Intra-Cluster Stress · "
-        "Markers = Stress Traffic Light (🟢 <25% · 🟠 25–50% · 🔴 >50% · ⚪ Not Held)"
+        "OT Arrows = Minimum-Work Plan to Flatten Terrain (🔵 Local Swap · 🟠 Mid Haul · 🔴 Long-Range Factor Haul)"
     )
 else:
-    st.subheader("Portfolio Risk Topography — 1 Year Ago vs. Today")
+    st.subheader("Portfolio Risk Topography & Optimal Transport — 1 Year Ago vs. Today")
 
 raw_new = load_cluster_file(file_new, "Today")
 raw_old = load_cluster_file(file_old, "1Y_Ago")
@@ -1234,9 +1415,9 @@ if raw_old is None or raw_new is None:
 df_old = prepare_dataframe(raw_old, weight_col)
 df_new = prepare_dataframe(raw_new, weight_col)
 
-rmsd = np.nan
+rmsd, n_shared_ids = np.nan, len(set(df_old["Node_ID"]).intersection(set(df_new["Node_ID"])))
 if do_procrustes:
-    df_old, rmsd = align_procrustes(df_old, df_new)
+    df_old, rmsd, n_shared_ids = align_procrustes(df_old, df_new)
 
 anchors_old = compute_anchors(df_old) if show_beacons else None
 anchors_new = compute_anchors(df_new) if show_beacons else None
@@ -1274,7 +1455,7 @@ Z_new, S_new, nz_new, sig_new = evaluate_surface(
 z_lim = float(max(np.abs(Z_old).max(), np.abs(Z_new).max(), 1.0)) * 1.15
 
 # Shared concentric Benchmark ring radii across BOTH snapshots
-max_r_bench = 0.25
+max_r_bench = 0.35 * raw_span
 if anchors_old is not None and anchors_new is not None:
     d_o = np.hypot(df_old["X"] - anchors_old["bench"][0], df_old["Y"] - anchors_old["bench"][1]).max()
     d_n = np.hypot(df_new["X"] - anchors_new["bench"][0], df_new["Y"] - anchors_new["bench"][1]).max()
@@ -1285,58 +1466,65 @@ r_mid = min(2.0 * r_core, 0.72 * max_r_bench)
 r_outer = min(3.0 * r_core, 0.98 * max_r_bench)
 ring_radii = (r_core, r_mid, r_outer)
 
-# Geometric metrics & straddle bridges
-m_old = compute_geometric_metrics(df_old, anchors_old)
-m_new = compute_geometric_metrics(df_new, anchors_new)
+# Solve Exact 2D Optimal Transport Flattening Plan for BOTH periods
+ot_old = solve_optimal_transport(df_old, nz_old, r_core, r_mid)
+ot_new = solve_optimal_transport(df_new, nz_new, r_core, r_mid)
 
-bridges_old = (
-    find_straddle_bridges(df_old, nz_old, anchors_old, min_bridge_ow, max_bridges)
-    if (show_beacons and show_bridges)
+vis_routes_old = (
+    [r for r in ot_old["routes"] if r["mass_pct"] >= min_ot_mass_pct][:top_k_ot]
+    if show_ot_flows
     else []
 )
-bridges_new = (
-    find_straddle_bridges(df_new, nz_new, anchors_new, min_bridge_ow, max_bridges)
-    if (show_beacons and show_bridges)
+vis_routes_new = (
+    [r for r in ot_new["routes"] if r["mass_pct"] >= min_ot_mass_pct][:top_k_ot]
+    if show_ot_flows
     else []
 )
 
 # ---------------------------------------------------------
-# TOP KPI BAR (HONEST TWO-MOMENT DIAGNOSIS)
+# TOP KPI BAR: W1 = ACTIVE SHARE x MEAN HAUL DISTANCE
 # ---------------------------------------------------------
 k1, k2, k3, k4, k5 = st.columns(5)
 k1.metric(
     "Active Share (1Y → Now)",
-    f"{m_new['active_share']:.1f}%",
-    delta=f"{m_new['active_share'] - m_old['active_share']:+.1f}%",
+    f"{ot_new['active_share']:.1f}%",
+    delta=f"{ot_new['active_share'] - ot_old['active_share']:+.1f}%",
     delta_color="off",
+    help="Total active weight to move in order to flatten the portfolio.",
+)
+k2.metric(
+    "2D W₁ Flattening Cost",
+    f"{ot_new['w1_cost']:.4f}",
+    delta=f"{ot_new['w1_cost'] - ot_old['w1_cost']:+.4f}",
+    delta_color="inverse",
+    help="Minimum earth-moving work (Active Share × Mean Haul Distance) to flatten peaks into valleys.",
+)
+k3.metric(
+    "Mean Haul Dist L̄_OT",
+    f"{ot_new['mean_haul']:.4f}",
+    delta=f"{ot_new['mean_haul'] - ot_old['mean_haul']:+.4f}",
+    delta_color="inverse",
+    help="W₁ / Active Share. Low = local correlated swaps; High = long-range cross-factor hauling.",
 )
 
-if pd.notna(m_new["net_tilt"]) and pd.notna(m_old["net_tilt"]):
-    k2.metric(
-        "Net Tilt ||P − B|| (1st Moment)",
-        f"{m_new['net_tilt']:.4f}",
-        delta=f"{m_new['net_tilt'] - m_old['net_tilt']:+.4f}",
-        delta_color="inverse",
-        help="Directional center-of-mass drift. Can approach 0 even under a barbell straddle.",
-    )
-    k3.metric(
-        "Geometric Tension (2nd Moment)",
-        f"{m_new['tension_rms']:.4f}",
-        delta=f"{m_new['tension_rms'] - m_old['tension_rms']:+.4f}",
-        delta_color="inverse",
-        help="Active-weighted RMS distance from Benchmark. Exposes barbell / counter-bet tension.",
-    )
+if anchors_old is not None and anchors_new is not None:
+    tilt_old = float(np.hypot(
+        anchors_old["port"][0] - anchors_old["bench"][0],
+        anchors_old["port"][1] - anchors_old["bench"][1],
+    ))
+    tilt_new = float(np.hypot(
+        anchors_new["port"][0] - anchors_new["bench"][0],
+        anchors_new["port"][1] - anchors_new["bench"][1],
+    ))
     k4.metric(
-        "Active Work Σ|aᵢ|·dᵢ",
-        f"{m_new['active_work']:.4f}",
-        delta=f"{m_new['active_work'] - m_old['active_work']:+.4f}",
+        "Net Tilt ||P − B||",
+        f"{tilt_new:.4f}",
+        delta=f"{tilt_new - tilt_old:+.4f}",
         delta_color="inverse",
-        help="Total active transport work around Benchmark (mirrors W1 distance).",
+        help="1st-moment center-of-mass drift relative to Benchmark.",
     )
 else:
-    k2.metric("Net Tilt ||P − B||", "N/A")
-    k3.metric("Geometric Tension", "N/A")
-    k4.metric("Active Work", "N/A")
+    k4.metric("Net Tilt ||P − B||", "N/A")
 
 held_old = df_old.loc[~df_old["Is_Not_Held"], "Stress_Pct"]
 held_new = df_new.loc[~df_new["Is_Not_Held"], "Stress_Pct"]
@@ -1349,11 +1537,15 @@ k5.metric(
     delta_color="inverse",
 )
 
-if not slide_mode and pd.notna(rmsd):
+if not slide_mode:
+    proc_txt = (
+        f"Procrustes RMSD: `{rmsd:.4f}` (`{n_shared_ids}` shared IDs)"
+        if pd.notna(rmsd)
+        else f"Procrustes skipped (`{n_shared_ids}` shared IDs — dynamic/distinct cluster sets)"
+    )
     st.caption(
-        f"Procrustes Alignment RMSD: `{rmsd:.4f}` · "
-        f"Shared Rings: Core ≤ `{r_core:.2f}` | Mid ≤ `{r_mid:.2f}` | Outer > `{r_mid:.2f}` · "
-        f"Tip: click the 📷 icon on any chart for a 3× high-res PNG slide export."
+        f"{proc_txt} · Shared Rings: Core ≤ `{r_core:.2f}` | Mid ≤ `{r_mid:.2f}` | Outer > `{r_mid:.2f}` · "
+        f"Click 📷 on any chart for a 3× high-res PNG."
     )
 
 # ---------------------------------------------------------
@@ -1369,7 +1561,7 @@ if view_mode in ("3D Terrain + 2D Top-Down Map", "3D Terrain Only"):
             df_old, x_grid, y_grid, Z_old, S_old, nz_old, sig_old,
             x_range, y_range, z_lim, color_mode, stress_cap,
             show_sea_level, show_labels, top_n_labels, min_marker_active,
-            use_stress_halo, anchors_old, show_rings, ring_radii, bridges_old,
+            use_stress_halo, anchors_old, show_rings, ring_radii, vis_routes_old,
             blend_mode, cam_cfg,
         )
         st.plotly_chart(fig_3d_old, use_container_width=True, config=plotly_export_config("Risk_3D_1Y_Ago"))
@@ -1380,7 +1572,7 @@ if view_mode in ("3D Terrain + 2D Top-Down Map", "3D Terrain Only"):
             df_new, x_grid, y_grid, Z_new, S_new, nz_new, sig_new,
             x_range, y_range, z_lim, color_mode, stress_cap,
             show_sea_level, show_labels, top_n_labels, min_marker_active,
-            use_stress_halo, anchors_new, show_rings, ring_radii, bridges_new,
+            use_stress_halo, anchors_new, show_rings, ring_radii, vis_routes_new,
             blend_mode, cam_cfg,
         )
         st.plotly_chart(fig_3d_new, use_container_width=True, config=plotly_export_config("Risk_3D_Today"))
@@ -1414,21 +1606,21 @@ if view_mode in ("3D Terrain + 2D Top-Down Map", "2D Top-Down Map Only"):
 
     with c2d_l:
         fig_2d_old = make_2d_topomap_figure(
-            "🗺️ 1 Year Ago — Metric-True Top-Down Factor Map",
+            "🗺️ 1 Year Ago — Optimal Transport Flattening Map",
             df_old, x_grid, y_grid, Z_old, S_old, nz_old, sig_old,
             x_range, y_range, z_lim, color_mode, stress_cap,
             show_labels, top_n_labels, min_marker_active,
-            use_stress_halo, anchors_old, show_rings, ring_radii, bridges_old,
+            use_stress_halo, anchors_old, show_rings, ring_radii, vis_routes_old,
         )
         st.plotly_chart(fig_2d_old, use_container_width=True, config=plotly_export_config("Risk_2D_1Y_Ago"))
 
     with c2d_r:
         fig_2d_new = make_2d_topomap_figure(
-            "🗺️ Today — Metric-True Top-Down Factor Map",
+            "🗺️ Today — Optimal Transport Flattening Map",
             df_new, x_grid, y_grid, Z_new, S_new, nz_new, sig_new,
             x_range, y_range, z_lim, color_mode, stress_cap,
             show_labels, top_n_labels, min_marker_active,
-            use_stress_halo, anchors_new, show_rings, ring_radii, bridges_new,
+            use_stress_halo, anchors_new, show_rings, ring_radii, vis_routes_new,
         )
         st.plotly_chart(fig_2d_new, use_container_width=True, config=plotly_export_config("Risk_2D_Today"))
 
@@ -1436,89 +1628,58 @@ if view_mode in ("3D Terrain + 2D Top-Down Map", "2D Top-Down Map Only"):
 # SECONDARY TABLES (HIDDEN IN SLIDE MODE)
 # ---------------------------------------------------------
 if not slide_mode:
-    if show_beacons and show_bridges and (bridges_old or bridges_new):
+    if show_ot_flows and (vis_routes_old or vis_routes_new):
         st.markdown("---")
-        st.subheader("⚠️ Active '3rd Bet' Cross-Benchmark Tension Pairs")
-        bt_l, bt_r = st.columns(2)
-        for col_obj, b_title, b_list in [
-            (bt_l, "1 Year Ago — Top Straddling Overweights", bridges_old),
-            (bt_r, "Today — Top Straddling Overweights", bridges_new),
+        st.subheader("🚚 Top Optimal Transport Flattening Routes (Peak → Valley)")
+        ot_l, ot_r = st.columns(2)
+        for col_obj, r_title, r_list in [
+            (ot_l, f"1 Year Ago (W₁ = {ot_old['w1_cost']:.4f} | L̄_OT = {ot_old['mean_haul']:.3f})", vis_routes_old),
+            (ot_r, f"Today (W₁ = {ot_new['w1_cost']:.4f} | L̄_OT = {ot_new['mean_haul']:.3f})", vis_routes_new),
         ]:
             with col_obj:
-                st.markdown(f"**{b_title}**")
-                if b_list:
-                    b_df = pd.DataFrame(
+                st.markdown(f"**{r_title}**")
+                if r_list:
+                    r_df = pd.DataFrame(
                         [
                             {
-                                "Leg A": f"{b['label_i']} ({b['act_i']:+.1f}%)",
-                                "Leg B": f"{b['label_j']} ({b['act_j']:+.1f}%)",
-                                "Separation d_ij": b["sep"],
-                                "Angle (°)": b["angle_deg"],
-                                "Tension Score": b["score"],
+                                "Peak (Source)": f"{r['peak_label']} ({r['peak_act']:+.1f}%)",
+                                "Valley (Sink)": f"{r['valley_label']} ({r['valley_act']:+.1f}%)",
+                                "Moved Wt (%)": r["mass_pct"],
+                                "Haul Dist": r["dist"],
+                                "% of W₁": r["share_w1_pct"],
+                                "Type": r["haul_type"],
                             }
-                            for b in b_list
+                            for r in r_list
                         ]
                     )
                     st.dataframe(
-                        b_df.style.format(
-                            {"Separation d_ij": "{:.3f}", "Angle (°)": "{:.0f}°", "Tension Score": "{:.3f}"}
+                        r_df.style.format(
+                            {"Moved Wt (%)": "{:.2f}%", "Haul Dist": "{:.3f}", "% of W₁": "{:.1f}%"}
                         ),
                         use_container_width=True,
                         hide_index=True,
                     )
                 else:
-                    st.caption("No material opposite-flank overweight pairs detected.")
+                    st.caption("No routes above the minimum mass filter.")
 
-    st.markdown("---")
-    st.subheader("🔄 Cluster Migration & Stress Shift (Today vs. 1 Year Ago)")
-
-    comp = pd.merge(
-        df_old[["Node_ID", "Node_Label", "Active_Pct", "Stress_Pct", "X", "Y"]],
-        df_new[["Node_ID", "Node_Label", "Active_Pct", "Stress_Pct", "X", "Y"]],
-        on="Node_ID",
-        how="outer",
-        suffixes=("_1Y", "_Now"),
-    )
-    comp["Cluster"] = comp["Node_Label_Now"].fillna(comp["Node_Label_1Y"])
-    comp["Δ Active Wt (%)"] = comp["Active_Pct_Now"].fillna(0.0) - comp["Active_Pct_1Y"].fillna(0.0)
-    comp["Δ Stress (pp)"] = comp["Stress_Pct_Now"].fillna(0.0) - comp["Stress_Pct_1Y"].fillna(0.0)
-    comp["Map Shift (ΔXY)"] = np.sqrt(
-        (comp["X_Now"] - comp["X_1Y"]) ** 2 + (comp["Y_Now"] - comp["Y_1Y"]) ** 2
-    )
-
-    display_tbl = comp[
-        [
-            "Cluster",
-            "Active_Pct_1Y",
-            "Active_Pct_Now",
-            "Δ Active Wt (%)",
-            "Stress_Pct_1Y",
-            "Stress_Pct_Now",
-            "Δ Stress (pp)",
-            "Map Shift (ΔXY)",
-        ]
-    ].rename(
-        columns={
-            "Active_Pct_1Y": "Active Wt 1Y (%)",
-            "Active_Pct_Now": "Active Wt Now (%)",
-            "Stress_Pct_1Y": "Stress 1Y (%)",
-            "Stress_Pct_Now": "Stress Now (%)",
+    if show_cluster_table:
+        st.markdown("---")
+        st.subheader(f"🔄 Cluster Migration Table ({cluster_match_mode})")
+        tbl = build_cluster_comparison_table(df_old, df_new, cluster_match_mode)
+        fmt_map = {
+            "Match Dist (ΔXY)": "{:.4f}",
+            "Spatial Dist (ΔXY)": "{:.4f}",
+            "Active Wt 1Y (%)": "{:+.2f}%",
+            "Active Wt Now (%)": "{:+.2f}%",
+            "Δ Active Wt (%)": "{:+.2f}%",
+            "Stress 1Y (%)": "{:.1f}%",
+            "Stress Now (%)": "{:.1f}%",
+            "Δ Stress (pp)": "{:+.1f}",
         }
-    ).sort_values("Δ Active Wt (%)", key=lambda s: s.abs(), ascending=False)
-
-    st.dataframe(
-        display_tbl.set_index("Cluster").style.format(
-            {
-                "Active Wt 1Y (%)": "{:+.2f}%",
-                "Active Wt Now (%)": "{:+.2f}%",
-                "Δ Active Wt (%)": "{:+.2f}%",
-                "Stress 1Y (%)": "{:.1f}%",
-                "Stress Now (%)": "{:.1f}%",
-                "Δ Stress (pp)": "{:+.1f}",
-                "Map Shift (ΔXY)": "{:.4f}",
-            },
-            na_rep="—",
-        ),
-        use_container_width=True,
-        height=380,
-    )
+        active_fmt = {k: v for k, v in fmt_map.items() if k in tbl.columns}
+        st.dataframe(
+            tbl.style.format(active_fmt, na_rep="—"),
+            use_container_width=True,
+            hide_index=True,
+            height=380,
+        )
